@@ -42,8 +42,18 @@ CPP_TEST_DIR  := $(CPP_DIR)/tests
 CPP_TEST_SRCS := $(wildcard $(CPP_TEST_DIR)/test_*.cpp)
 CPP_TEST_BINS := $(patsubst $(CPP_TEST_DIR)/%.cpp,$(CPP_BUILD_DIR)/tests/%,$(CPP_TEST_SRCS))
 
+# Go integration (CGO Pattern B: Go links the prebuilt static library).
+# Go's build cache does not track $(CORE_LIB), so after a library rebuild a
+# plain `go build` can reuse a stale cgo package (DECISIONS DR-11). Passing a
+# hash of the library in CGO_LDFLAGS makes Go's cache key change exactly when
+# the library's content does. The hash is computed when the recipe runs, i.e.
+# after $(CORE_LIB) has been rebuilt as a prerequisite.
+GO_ENV = CGO_ENABLED=1 CGO_LDFLAGS="-Wl,--build-id=0x$$(sha256sum $(CORE_LIB) | cut -c1-16)"
+NODE_BIN   := aletheia-node
+CLIENT_BIN := aletheia-client
+
 # Phony targets
-.PHONY: all cpp-lib test clean help
+.PHONY: all cpp-lib test clean help go-build go-test check node client
 
 # Default target: build the C++ core static library for Go linking
 all: cpp-lib
@@ -54,6 +64,11 @@ help:
 	@echo "  all       - Build the C++ core static library ($(CORE_LIB))"
 	@echo "  cpp-lib   - Compile C++ sources and create static library"
 	@echo "  test      - Build and run every C++ test in $(CPP_TEST_DIR)/test_*.cpp"
+	@echo "  go-build  - Build the library, then compile every Go package"
+	@echo "  go-test   - Build the library, then go vet and go test -race -count=1 ./..."
+	@echo "  check     - test + go-test"
+	@echo "  node      - Build ./$(NODE_BIN) from ./cmd/fullnode"
+	@echo "  client    - Build ./$(CLIENT_BIN) from ./cmd/lightclient"
 	@echo "  clean     - Remove build artifacts, object files, and libraries"
 	@echo "  help      - Display this usage help"
 
@@ -83,10 +98,28 @@ $(CPP_BUILD_DIR)/tests/%: $(CPP_TEST_DIR)/%.cpp $(CORE_LIB)
 	@mkdir -p $(CPP_BUILD_DIR)/tests
 	$(CXX) $(CXX_REQUIRED) $(DEPFLAGS) $(CXXFLAGS) $(INCLUDES) $< $(CORE_LIB) -o $@
 
+# Go targets depend on the library, so `make go-test` always links a fresh one.
+# -count=1 disables cached test results, which would otherwise hide a change
+# made only in C++.
+go-build: $(CORE_LIB)
+	$(GO_ENV) $(GO) build ./...
+
+go-test: $(CORE_LIB)
+	$(GO_ENV) $(GO) vet ./...
+	$(GO_ENV) $(GO) test -race -count=1 ./...
+
+check: test go-test
+
+node: $(CORE_LIB)
+	$(GO_ENV) $(GO) build -o $(NODE_BIN) ./cmd/fullnode
+
+client: $(CORE_LIB)
+	$(GO_ENV) $(GO) build -o $(CLIENT_BIN) ./cmd/lightclient
+
 # Header dependency files produced by DEPFLAGS (absent on a clean tree).
 -include $(CPP_OBJS:.o=.d) $(CPP_TEST_BINS:=.d)
 
 # Clean target to remove compiled objects and binaries
 clean:
 	rm -rf $(CPP_BUILD_DIR) $(CPP_LIB_DIR)
-	rm -f aletheia-node aletheia-client
+	rm -f $(NODE_BIN) $(CLIENT_BIN)
